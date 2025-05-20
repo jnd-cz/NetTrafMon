@@ -22,6 +22,7 @@ const (
 	DBPath    = "/var/lib/netmonitor/traffic.db"
 	LogPath   = "/var/log/netmonitor/netmonitor.log"
 	CollectInterval = 60 // seconds
+	SlidingWindowDays = 30
 )
 
 type NetworkTraffic struct {
@@ -318,7 +319,7 @@ func getTrafficStats(interfaceName, timeRange string) (TrafficStats, error) {
 func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 	now := time.Now()
 	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	
+
 	// Calculate days in current month
 	var daysInMonth float64
 	if now.Month() == 2 {
@@ -332,64 +333,112 @@ func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 	} else {
 		daysInMonth = 31
 	}
-	
+
 	// Calculate how many days have passed in the current month
 	daysPassed := now.Sub(startOfMonth).Hours() / 24
 	daysRemaining := daysInMonth - daysPassed
-	
-	// First, find out the earliest record in the database for this interface
-	var earliestTimestamp string
+
+	var hourlyRate float64
+	var timespanForRateCalculationHours float64
+	var timespanText string // For description
+
+	// Sliding window calculation
+	slidingWindowStartDate := now.AddDate(0, 0, -SlidingWindowDays)
+	var slidingWindowTotalBytes sql.NullInt64
+	var slidingWindowMinTimestamp, slidingWindowMaxTimestamp sql.NullString
+
 	err := db.QueryRow(`
-		SELECT MIN(timestamp) 
-		FROM network_traffic 
-		WHERE interface = ?
-	`, interfaceName).Scan(&earliestTimestamp)
+		SELECT SUM(bytes_combined), MIN(timestamp), MAX(timestamp)
+		FROM network_traffic
+		WHERE interface = ? AND timestamp >= ?
+	`, interfaceName, slidingWindowStartDate.Format("2006-01-02 15:04:05")).Scan(
+		&slidingWindowTotalBytes, &slidingWindowMinTimestamp, &slidingWindowMaxTimestamp,
+	)
+
+	if err == nil && slidingWindowTotalBytes.Valid && slidingWindowTotalBytes.Int64 > 0 && slidingWindowMinTimestamp.Valid && slidingWindowMaxTimestamp.Valid {
+		minTime, errMin := time.Parse("2006-01-02 15:04:05", slidingWindowMinTimestamp.String)
+		maxTime, errMax := time.Parse("2006-01-02 15:04:05", slidingWindowMaxTimestamp.String)
+
+		if errMin == nil && errMax == nil {
+			slidingWindowDurationHours := maxTime.Sub(minTime).Hours()
+			if slidingWindowDurationHours >= 24 { // Ensure significant data in window
+				hourlyRate = float64(slidingWindowTotalBytes.Int64) / slidingWindowDurationHours
+				timespanForRateCalculationHours = slidingWindowDurationHours
+				timespanText = fmt.Sprintf("last %d days (%.1f days actual data)", SlidingWindowDays, slidingWindowDurationHours/24)
+				logger.Printf("getMonthEstimate for %s: Using sliding window (%.1f hours of data) for rate calculation.", interfaceName, slidingWindowDurationHours)
+			}
+		}
+	}
+
+	// Fallback to all data if sliding window is insufficient
+	if hourlyRate == 0 {
+		logger.Printf("getMonthEstimate for %s: Sliding window data insufficient, falling back to all data.", interfaceName)
+		var earliestTimestamp string
+		errDb := db.QueryRow(`
+			SELECT MIN(timestamp) 
+			FROM network_traffic 
+			WHERE interface = ?
+		`, interfaceName).Scan(&earliestTimestamp)
+
+		if errDb != nil || earliestTimestamp == "" {
+			return MonthEstimate{
+				Interface:      interfaceName,
+				EstimatedData:  0,
+				HumanEstimated: "No data available",
+			}, nil
+		}
+
+		earliestTime, errParse := time.Parse("2006-01-02 15:04:05", earliestTimestamp)
+		if errParse != nil {
+			return MonthEstimate{}, errParse
+		}
+
+		totalTimeSpanAllData := now.Sub(earliestTime).Hours()
+
+		if totalTimeSpanAllData < 0.25 { // Less than 15 minutes of data overall
+			return MonthEstimate{
+				Interface:      interfaceName,
+				EstimatedData:  0,
+				HumanEstimated: "Insufficient data (< 15 minutes total)",
+			}, nil
+		}
+
+		var totalBytesAllTime sql.NullInt64
+		errDb = db.QueryRow(`
+			SELECT SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ?
+		`, interfaceName).Scan(&totalBytesAllTime)
+
+		if errDb != nil || !totalBytesAllTime.Valid || totalBytesAllTime.Int64 == 0 {
+			return MonthEstimate{
+				Interface:      interfaceName,
+				EstimatedData:  0,
+				HumanEstimated: "No traffic recorded",
+			}, nil
+		}
+		hourlyRate = float64(totalBytesAllTime.Int64) / totalTimeSpanAllData
+		timespanForRateCalculationHours = totalTimeSpanAllData
+		if totalTimeSpanAllData < 1.0 {
+			timespanText = fmt.Sprintf("%.0f min (all data)", totalTimeSpanAllData*60)
+		} else if totalTimeSpanAllData < 24.0 {
+			timespanText = fmt.Sprintf("%.1f hours (all data)", totalTimeSpanAllData)
+		} else {
+			timespanText = fmt.Sprintf("%.1f days (all data)", totalTimeSpanAllData/24)
+		}
+		logger.Printf("getMonthEstimate for %s: Using all available data (%.1f hours) for rate calculation.", interfaceName, totalTimeSpanAllData)
+	}
 	
-	if err != nil || earliestTimestamp == "" {
+	// Final check if hourlyRate is still zero (e.g. no data at all after all attempts)
+	if hourlyRate == 0 {
 		return MonthEstimate{
 			Interface:      interfaceName,
 			EstimatedData:  0,
-			HumanEstimated: "No data available",
+			HumanEstimated: "Could not determine rate (no data or insufficient data)",
 		}, nil
 	}
-	
-	// Parse the earliest timestamp
-	earliestTime, err := time.Parse("2006-01-02 15:04:05", earliestTimestamp)
-	if err != nil {
-		return MonthEstimate{}, err
-	}
-	
-	// Calculate the total time span we have data for (in hours)
-	totalTimeSpan := now.Sub(earliestTime).Hours()
-	
-	// If we have less than 15 minutes of data, not enough for reliable estimate
-	if totalTimeSpan < 0.25 {
-		return MonthEstimate{
-			Interface:      interfaceName,
-			EstimatedData:  0,
-			HumanEstimated: "Insufficient data (< 15 minutes)",
-		}, nil
-	}
-	
-	// Get total traffic over the entire time span
-	var totalBytes sql.NullInt64
-	err = db.QueryRow(`
-		SELECT SUM(bytes_combined) 
-		FROM network_traffic 
-		WHERE interface = ?
-	`, interfaceName).Scan(&totalBytes)
-	
-	if err != nil || !totalBytes.Valid || totalBytes.Int64 == 0 {
-		return MonthEstimate{
-			Interface:      interfaceName,
-			EstimatedData:  0,
-			HumanEstimated: "No traffic recorded",
-		}, nil
-	}
-	
-	// Calculate hourly rate based on all available data
-	hourlyRate := float64(totalBytes.Int64) / totalTimeSpan
-	
+
+
 	// Get current month data if available
 	var monthToDateBytes sql.NullInt64
 	err = db.QueryRow(`
@@ -403,19 +452,6 @@ func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 		actualMonthBytes = uint64(monthToDateBytes.Int64)
 	}
 	
-	// Format timespan for display
-	var timespanText string
-	if totalTimeSpan < 1.0 {
-		// If less than 1 hour, show in minutes
-		timespanText = fmt.Sprintf("%.0f min", totalTimeSpan*60)
-	} else if totalTimeSpan < 24.0 {
-		// If less than 1 day, show in hours
-		timespanText = fmt.Sprintf("%.1f hours", totalTimeSpan)
-	} else {
-		// If more than 1 day, show in days
-		timespanText = fmt.Sprintf("%.1f days", totalTimeSpan/24)
-	}
-	
 	// Calculate monthly estimate
 	var estimatedBytes uint64
 	var estimateDescription string
@@ -423,21 +459,27 @@ func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 	if daysPassed < 1.0 || actualMonthBytes == 0 {
 		// Beginning of month or no month data yet - estimate entire month
 		estimatedBytes = uint64(hourlyRate * 24.0 * daysInMonth)
-		estimateDescription = fmt.Sprintf("(based on %s of data)", timespanText)
+		estimateDescription = fmt.Sprintf("(full month estimate, rate based on %s)", timespanText)
 	} else {
 		// Mid-month with some data - use actual data plus estimate for remaining days
 		remainingEstimate := uint64(hourlyRate * 24.0 * daysRemaining)
 		estimatedBytes = actualMonthBytes + remainingEstimate
-		estimateDescription = fmt.Sprintf("(%s actual + estimate for remaining days)", humanReadableSize(actualMonthBytes))
+		estimateDescription = fmt.Sprintf("(%s actual + %s estimate for remaining days, rate based on %s)", 
+			humanReadableSize(actualMonthBytes), 
+			humanReadableSize(remainingEstimate), 
+			timespanText)
 	}
 	
 	// Add confidence level based on data span length
-	if totalTimeSpan < 1.0 {
+	// Use timespanForRateCalculationHours which reflects the actual data period used for rate.
+	if timespanForRateCalculationHours < 24.0 { // Less than 1 day of data for rate
 		estimateDescription += " [low confidence]"
-	} else if totalTimeSpan < 24.0 {
+	} else if timespanForRateCalculationHours < 24.0*7 { // 1 to 7 days of data for rate
 		estimateDescription += " [medium confidence]"
+	} else { // 7+ days of data for rate
+		estimateDescription += " [high confidence]"
 	}
-	
+
 	return MonthEstimate{
 		Interface:      interfaceName,
 		EstimatedData:  estimatedBytes,
