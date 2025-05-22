@@ -83,6 +83,49 @@ func humanReadableSize(bytes uint64) string {
 	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+func formatUptime(d time.Duration) string {
+	// Round seconds to the nearest whole number
+	seconds := int(d.Seconds() + 0.5)
+
+	days := seconds / (24 * 3600)
+	seconds %= (24 * 3600)
+	hours := seconds / 3600
+	seconds %= 3600
+	minutes := seconds / 60
+	seconds %= 60
+
+	var parts []string
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%d days", days))
+	}
+	if hours > 0 || (days == 0 && hours > 0) { // Added condition to include hours if days is 0 but hours > 0
+		parts = append(parts, fmt.Sprintf("%d hours", hours))
+	}
+	if minutes > 0 || (days == 0 && hours == 0 && minutes > 0) { // Added condition to include minutes if days and hours are 0 but minutes > 0
+		parts = append(parts, fmt.Sprintf("%d minutes", minutes))
+	}
+	// Always include seconds if it's the only unit or if other units are present
+	if seconds > 0 || (days == 0 && hours == 0 && minutes == 0) {
+		parts = append(parts, fmt.Sprintf("%d seconds", seconds))
+	}
+
+	if len(parts) == 0 {
+		return "0 seconds" // Handle case where duration is less than a second and rounds to 0
+	}
+
+	// Join parts with spaces, but this might not be the most natural way to read it.
+	// Consider a more sophisticated joining logic if needed.
+	// For now, simple space join.
+	var result string
+	for i, p := range parts {
+		if i > 0 {
+			result += " "
+		}
+		result += p
+	}
+	return result
+}
+
 func setupLogger() {
 	// Create log directory if it doesn't exist
 	logDir := filepath.Dir(LogPath)
@@ -471,7 +514,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	
 	hostname, _ := os.Hostname()
-	uptime := time.Since(startTime).String()
+	uptime := formatUptime(time.Since(startTime))
 
 	sysInfo := SystemInfo{
 		Version:  Version,
@@ -659,7 +702,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 
 	// Get data for the template
 	hostname, _ := os.Hostname()
-	uptime := time.Since(startTime).String()
+	uptime := formatUptime(time.Since(startTime))
 	
 	currentStats := make(map[string]TrafficStats)
 	historyStats := make(map[string][]TrafficStats)
@@ -706,7 +749,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 		MonthEstimates []MonthEstimate
 	}{
 		Version:        Version,
-		Uptime:         uptime,
+		Uptime:         uptime, // This now uses the formatted uptime
 		Hostname:       hostname,
 		CurrentStats:   currentStats,
 		HistoryStats:   historyStats,
