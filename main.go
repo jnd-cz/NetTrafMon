@@ -22,7 +22,7 @@ const (
 	DBPath    = "/var/lib/netmonitor/traffic.db"
 	LogPath   = "/var/log/netmonitor/netmonitor.log"
 	CollectInterval = 60 // seconds
-	SlidingWindowDays = 30
+	SlidingWindowDays = 7 // Previously 30
 )
 
 type NetworkTraffic struct {
@@ -361,18 +361,24 @@ func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 
 		if errMin == nil && errMax == nil {
 			slidingWindowDurationHours := maxTime.Sub(minTime).Hours()
-			if slidingWindowDurationHours >= 24 { // Ensure significant data in window
+			// For the 7-day window, use if at least 15 minutes of actual data.
+			if slidingWindowDurationHours >= 0.25 { 
 				hourlyRate = float64(slidingWindowTotalBytes.Int64) / slidingWindowDurationHours
 				timespanForRateCalculationHours = slidingWindowDurationHours
-				timespanText = fmt.Sprintf("last %d days (%.1f days actual data)", SlidingWindowDays, slidingWindowDurationHours/24)
-				logger.Printf("getMonthEstimate for %s: Using sliding window (%.1f hours of data) for rate calculation.", interfaceName, slidingWindowDurationHours)
+				// Adjust timespanText to show hours or minutes if duration is less than a day
+				if slidingWindowDurationHours < 24 {
+					timespanText = fmt.Sprintf("last %d days (%.1f hours actual data)", SlidingWindowDays, slidingWindowDurationHours)
+				} else {
+					timespanText = fmt.Sprintf("last %d days (%.1f days actual data)", SlidingWindowDays, slidingWindowDurationHours/24)
+				}
+				logger.Printf("getMonthEstimate for %s: Using sliding window (last %d days, %.2f hours actual data) for rate calculation.", interfaceName, SlidingWindowDays, slidingWindowDurationHours)
 			}
 		}
 	}
 
-	// Fallback to all data if sliding window is insufficient
+	// Fallback to all data if sliding window is insufficient (hourlyRate still 0)
 	if hourlyRate == 0 {
-		logger.Printf("getMonthEstimate for %s: Sliding window data insufficient, falling back to all data.", interfaceName)
+		logger.Printf("getMonthEstimate for %s: Sliding window data insufficient (<15min actual in last %d days), falling back to all data.", interfaceName, SlidingWindowDays)
 		var earliestTimestamp string
 		errDb := db.QueryRow(`
 			SELECT MIN(timestamp) 
@@ -472,11 +478,11 @@ func getMonthEstimate(interfaceName string) (MonthEstimate, error) {
 	
 	// Add confidence level based on data span length
 	// Use timespanForRateCalculationHours which reflects the actual data period used for rate.
-	if timespanForRateCalculationHours < 24.0 { // Less than 1 day of data for rate
+	if timespanForRateCalculationHours < 1.0 { // Less than 1 hour of data for rate
 		estimateDescription += " [low confidence]"
-	} else if timespanForRateCalculationHours < 24.0*7 { // 1 to 7 days of data for rate
+	} else if timespanForRateCalculationHours >= 1.0 && timespanForRateCalculationHours < 24.0 { // 1 to 24 hours of data for rate
 		estimateDescription += " [medium confidence]"
-	} else { // 7+ days of data for rate
+	} else { // 24+ hours of data for rate
 		estimateDescription += " [high confidence]"
 	}
 
