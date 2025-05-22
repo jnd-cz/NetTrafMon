@@ -42,6 +42,8 @@ type TrafficStats struct {
 	HumanReceived   string    `json:"human_received"`
 	HumanSent       string    `json:"human_sent"`
 	HumanCombined   string    `json:"human_combined"`
+	ExtrapolatedMonthlyCombinedRate uint64 `json:"extrapolated_monthly_combined_rate"`
+	HumanExtrapolatedMonthlyCombinedRate string `json:"human_extrapolated_monthly_combined_rate"`
 }
 
 type MonthEstimate struct {
@@ -302,40 +304,92 @@ func cleanupOldData() {
 
 func getTrafficStats(interfaceName, timeRange string) (TrafficStats, error) {
 	var query string
-	var since time.Time
-	
+	var args []interface{}
 	now := time.Now()
-	
+	var durationDays float64
+	actualTimeRange := timeRange // Store the original timeRange for the map key, modify for display
+
 	switch timeRange {
 	case "hour":
-		since = now.Add(-time.Hour)
+		since := now.Add(-time.Hour)
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ?`
+		args = []interface{}{interfaceName, since.Format("2006-01-02 15:04:05")}
+		durationDays = 1.0 / 24.0
+		actualTimeRange = "Last Hour"
 	case "day":
-		since = now.AddDate(0, 0, -1)
+		since := now.AddDate(0, 0, -1)
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ?`
+		args = []interface{}{interfaceName, since.Format("2006-01-02 15:04:05")}
+		durationDays = 1.0
+		actualTimeRange = "Last 24 Hours"
 	case "week":
-		since = now.AddDate(0, 0, -7)
+		since := now.AddDate(0, 0, -7)
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ?`
+		args = []interface{}{interfaceName, since.Format("2006-01-02 15:04:05")}
+		durationDays = 7.0
+		actualTimeRange = "Last 7 Days"
 	case "month":
-		since = now.AddDate(0, -1, 0)
+		since := now.AddDate(0, 0, -30)
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ?`
+		args = []interface{}{interfaceName, since.Format("2006-01-02 15:04:05")}
+		durationDays = 30.0
+		actualTimeRange = "Last 30 Days"
+	case "previous_month":
+		endOfPreviousMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Add(-time.Nanosecond)
+		startOfPreviousMonth := time.Date(endOfPreviousMonth.Year(), endOfPreviousMonth.Month(), 1, 0, 0, 0, 0, now.Location())
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ? AND timestamp <= ?`
+		args = []interface{}{interfaceName, startOfPreviousMonth.Format("2006-01-02 15:04:05"), endOfPreviousMonth.Format("2006-01-02 15:04:05")}
+		durationDays = float64(endOfPreviousMonth.Day()) // Actual days in the previous month
+		actualTimeRange = fmt.Sprintf("Previous Month (%s)", startOfPreviousMonth.Format("January 2006"))
 	case "year":
-		since = now.AddDate(-1, 0, 0)
+		since := now.AddDate(-1, 0, 0)
+		query = `
+			SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
+			FROM network_traffic 
+			WHERE interface = ? AND timestamp >= ?`
+		args = []interface{}{interfaceName, since.Format("2006-01-02 15:04:05")}
+		// Approximate days in a year; can be made more precise if needed
+		if now.Year()%4 == 0 && (now.Year()%100 != 0 || now.Year()%400 == 0) {
+			durationDays = 366.0
+		} else {
+			durationDays = 365.0
+		}
+		actualTimeRange = "Last Year"
 	default:
 		return TrafficStats{}, fmt.Errorf("invalid time range: %s", timeRange)
 	}
-	
-	query = `
-		SELECT SUM(bytes_received), SUM(bytes_sent), SUM(bytes_combined) 
-		FROM network_traffic 
-		WHERE interface = ? AND timestamp >= ?
-	`
-	
+
 	var bytesReceived, bytesSent, bytesCombined sql.NullInt64
-	err := db.QueryRow(query, interfaceName, since.Format("2006-01-02 15:04:05")).Scan(
-		&bytesReceived, &bytesSent, &bytesCombined,
-	)
+	err := db.QueryRow(query, args...).Scan(&bytesReceived, &bytesSent, &bytesCombined)
 	if err != nil {
-		return TrafficStats{}, err
+		// Log error but return zero stats to avoid breaking the entire response
+		logger.Printf("Failed to query traffic stats for %s, range %s: %v", interfaceName, timeRange, err)
+		// Return zeroed stats but with the correct interface and time range labels
+		return TrafficStats{
+			Interface:      interfaceName,
+			TimeRange:      actualTimeRange,
+			HumanReceived:  humanReadableSize(0),
+			HumanSent:      humanReadableSize(0),
+			HumanCombined:  humanReadableSize(0),
+			HumanExtrapolatedMonthlyCombinedRate: humanReadableSize(0) + " (based on 0 data)",
+		}, nil // Return nil error to allow other stats to load
 	}
-	
-	// Convert nullable values to uint64
+
 	var rxBytes, txBytes, totalBytes uint64
 	if bytesReceived.Valid {
 		rxBytes = uint64(bytesReceived.Int64)
@@ -346,16 +400,54 @@ func getTrafficStats(interfaceName, timeRange string) (TrafficStats, error) {
 	if bytesCombined.Valid {
 		totalBytes = uint64(bytesCombined.Int64)
 	}
-	
+
+	var extrapolatedRate uint64
+	// Calculate days in current actual calendar month for "hour", "day", "week"
+	daysInCurrentMonth := float64(time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, now.Location()).Day())
+
+	switch timeRange {
+	case "hour", "day", "week":
+		if durationDays > 0 && totalBytes > 0 {
+			extrapolatedRate = uint64((float64(totalBytes) / durationDays) * daysInCurrentMonth)
+		} else {
+			extrapolatedRate = 0
+		}
+	case "month": // This is "Last 30 Days"
+		extrapolatedRate = totalBytes
+	case "previous_month":
+		extrapolatedRate = totalBytes
+	case "year":
+		if totalBytes > 0 {
+			extrapolatedRate = uint64(float64(totalBytes) / 12.0)
+		} else {
+			extrapolatedRate = 0
+		}
+	default:
+		// Should not happen if timeRange is validated, but as a fallback
+		extrapolatedRate = 0
+	}
+
+	humanExtrapolatedRate := humanReadableSize(extrapolatedRate)
+	if totalBytes == 0 && (timeRange == "hour" || timeRange == "day" || timeRange == "week" || timeRange == "month" || timeRange == "previous_month" || timeRange == "year") {
+		// Clarify if no data within the period for all ranges
+		humanExtrapolatedRate = humanReadableSize(0) + " (no data in period)"
+	} else if timeRange != "previous_month" && timeRange != "month" && durationDays <= 0 && totalBytes > 0 {
+		// Special case for N/A if durationDays is invalid for rate-based extrapolations
+		humanExtrapolatedRate = "N/A (invalid duration for rate)"
+	}
+
+
 	return TrafficStats{
 		Interface:      interfaceName,
-		TimeRange:      timeRange,
+		TimeRange:      actualTimeRange,
 		BytesReceived:  rxBytes,
 		BytesSent:      txBytes,
 		BytesCombined:  totalBytes,
 		HumanReceived:  humanReadableSize(rxBytes),
 		HumanSent:      humanReadableSize(txBytes),
 		HumanCombined:  humanReadableSize(totalBytes),
+		ExtrapolatedMonthlyCombinedRate: extrapolatedRate,
+		HumanExtrapolatedMonthlyCombinedRate: humanExtrapolatedRate,
 	}, nil
 }
 
@@ -574,7 +666,8 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	historyStats := make(map[string][]TrafficStats)
 	monthEstimates := make([]MonthEstimate, 0)
 	
-	timeRanges := []string{"hour", "day", "week", "month", "year"}
+	// Define the order of time ranges for display and processing
+	timeRanges := []string{"hour", "day", "week", "month", "previous_month", "year"}
 	
 	for _, iface := range interfaces {
 		// Get current stats for all time ranges
@@ -723,6 +816,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 						<th>Received</th>
 						<th>Sent</th>
 						<th>Combined</th>
+						<th>Extrapolated Monthly Rate</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -732,6 +826,7 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 						<td>{{$histStats.HumanReceived}}</td>
 						<td>{{$histStats.HumanSent}}</td>
 						<td>{{$histStats.HumanCombined}}</td>
+						<td>{{$histStats.HumanExtrapolatedMonthlyCombinedRate}}</td>
 					</tr>
 					{{end}}
 				</tbody>
@@ -753,10 +848,11 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 	uptime := formatUptime(time.Since(startTime))
 	
 	currentStats := make(map[string]TrafficStats)
-	historyStats := make(map[string][]TrafficStats)
+	historyStats := make(map[string][]TrafficStats) // This will store stats for all time ranges
 	monthEstimates := make([]MonthEstimate, 0)
 	
-	timeRanges := []string{"hour", "day", "week", "month", "year"}
+	// Define the order of time ranges for display and processing
+	timeRanges := []string{"hour", "day", "week", "month", "previous_month", "year"}
 	
 	for _, iface := range interfaces {
 		// Get current stats for all time ranges
