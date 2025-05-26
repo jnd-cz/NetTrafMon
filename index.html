@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+	<html>
+	<head>
+		<title>Network Traffic Monitor</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<style>
+			body {
+				font-family: Arial, sans-serif;
+				margin: 0;
+				padding: 20px;
+				line-height: 1.6;
+			}
+			.container {
+				max-width: 1200px;
+				margin: 0 auto;
+			}
+			h1, h2, h3 {
+				color: #333;
+			}
+			table {
+				width: 100%;
+				border-collapse: collapse;
+				margin: 20px 0;
+			}
+			th, td {
+				padding: 12px 15px;
+				border: 1px solid #ddd;
+				text-align: left;
+			}
+			th {
+				background-color: #f8f8f8;
+			}
+			tr:nth-child(even) {
+				background-color: #f2f2f2;
+			}
+			.stats-container {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 20px;
+			}
+			.stats-box {
+				flex: 1;
+				min-width: 250px;
+				padding: 15px;
+				border: 1px solid #ddd;
+				border-radius: 5px;
+				background-color: #fff;
+			}
+			.info-bar {
+				background-color: #f8f8f8;
+				padding: 10px;
+				border-radius: 5px;
+				margin-bottom: 20px;
+			}
+			.refresh-btn {
+				padding: 8px 16px;
+				background-color: #4CAF50;
+				color: white;
+				border: none;
+				border-radius: 4px;
+				cursor: pointer;
+			}
+			.refresh-btn:hover {
+				background-color: #45a049;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<div class="info-bar">
+				<h1>Network Traffic Monitor</h1>
+				<p>Version: {{.SystemInfo.Version}} | Uptime: {{.SystemInfo.Uptime}} | Hostname: {{.SystemInfo.Hostname}}</p>
+				<button class="refresh-btn" onclick="window.location.reload()">Refresh Data</button>
+			</div>
+
+			{{range $iface, $stats := .CurrentStats}}
+			<h2>Interface: {{$iface}}</h2>
+			
+			<div class="stats-container">
+				<div class="stats-box">
+					<h3>Latest Stats (Last Hour)</h3>
+					<p>Received: {{$stats.HumanReceived}}</p>
+					<p>Sent: {{$stats.HumanSent}}</p>
+					<p>Combined: {{$stats.HumanCombined}}</p>
+				</div>
+				
+				<div class="stats-box">
+					<h3>Month Estimate</h3>
+					{{range $.MonthEstimates}}
+						{{if eq .Interface $iface}}
+							<p>Estimated usage: {{.HumanEstimated}}</p>
+						{{end}}
+					{{end}}
+				</div>
+			</div>
+
+			<h3>Historical Data</h3>
+			<table>
+				<thead>
+					<tr>
+						<th>Time Range</th>
+						<th>Received</th>
+						<th>Sent</th>
+						<th>Combined</th>
+						<th>Extrapolated Monthly Rate</th>
+					</tr>
+				</thead>
+				<tbody>
+					{{range $histStats := index $.HistoryStats $iface}}
+					<tr>
+						<td>{{$histStats.TimeRange}}</td>
+						<td>{{$histStats.HumanReceived}}</td>
+						<td>{{$histStats.HumanSent}}</td>
+						<td>{{$histStats.HumanCombined}}</td>
+						<td>{{$histStats.HumanExtrapolatedMonthlyCombinedRate}}</td>
+					</tr>
+					{{end}}
+				</tbody>
+			</table>
+			{{end}}
+		</div>
+	</body>
+	</html>
