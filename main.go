@@ -19,8 +19,8 @@ import (
 
 const (
 	Version   = "1.0.0"
-	DBPath    = "/var/lib/netmonitor/traffic.db"
-	LogPath   = "/var/log/netmonitor/netmonitor.log"
+	DBPath    = "traffic.db"
+	LogPath   = "netmonitor.log"
 	CollectInterval = 60 // seconds
 )
 
@@ -68,6 +68,8 @@ var (
 	interfaces  []string
 	lastBytes   map[string]map[string]uint64 // interface -> direction -> bytes
 	logger      *log.Logger
+	effectiveDBPath string
+	effectiveLogPath string
 )
 
 func humanReadableSize(bytes uint64) string {
@@ -85,30 +87,30 @@ func humanReadableSize(bytes uint64) string {
 
 func setupLogger() {
 	// Create log directory if it doesn't exist
-	logDir := filepath.Dir(LogPath)
+	logDir := filepath.Dir(effectiveLogPath)
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		log.Fatalf("Failed to create log directory: %v", err)
 	}
-	
+
 	// Open log file
-	logFile, err := os.OpenFile(LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFile, err := os.OpenFile(effectiveLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
-	
+
 	logger = log.New(logFile, "NETMONITOR: ", log.Ldate|log.Ltime|log.Lshortfile)
 	logger.Println("Logger initialized")
 }
 
 func initDB() {
 	// Create database directory if it doesn't exist
-	dbDir := filepath.Dir(DBPath)
+	dbDir := filepath.Dir(effectiveDBPath)
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
 		logger.Fatalf("Failed to create database directory: %v", err)
 	}
 
 	var err error
-	db, err = sql.Open("sqlite3", DBPath)
+	db, err = sql.Open("sqlite3", effectiveDBPath)
 	if err != nil {
 		logger.Fatalf("Failed to open database: %v", err)
 	}
@@ -730,14 +732,34 @@ func startWebServer() {
 
 func main() {
 	startTime = time.Now()
-	
+
+	// Determine effective paths
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("Failed to get current working directory: %v", err)
+	}
+
+	envDBPath := os.Getenv("NETMONITOR_DB_PATH")
+	if envDBPath != "" {
+		effectiveDBPath = envDBPath
+	} else {
+		effectiveDBPath = filepath.Join(cwd, DBPath)
+	}
+
+	envLogPath := os.Getenv("NETMONITOR_LOG_PATH")
+	if envLogPath != "" {
+		effectiveLogPath = envLogPath
+	} else {
+		effectiveLogPath = filepath.Join(cwd, LogPath)
+	}
+
 	// Setup logger
 	setupLogger()
-	
+
 	// Initialize the database
 	initDB()
 	defer db.Close()
-	
+
 	// Detect network interfaces
 	detectInterfaces()
 	
